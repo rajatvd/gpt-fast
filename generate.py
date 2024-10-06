@@ -27,7 +27,7 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
 torch._inductor.config.fx_graph_cache = True
-torch._functorch.config.enable_autograd_cache = True
+# torch._functorch.config.enable_autograd_cache = True
 
 default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -544,7 +544,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path",
         type=Path,
-        default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+        # default=Path("checkpoints/meta-llama/Meta-Llama-3.1-8B/model.pth"),
+        default=Path("checkpoints/meta-llama/Meta-Llama-3.1-8B/model_int8.pth"),
         help="Model checkpoint path.",
     )
     parser.add_argument(
