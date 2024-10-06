@@ -321,7 +321,16 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        attn_bias = torch.zeros_like(mask, dtype=q.dtype)
+        attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
+        attn_weights = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) + attn_bias
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        y = attn_weights @ v
+
+        # print((y1 - y).abs().max() / y.abs().max())
+        # import ipdb; ipdb.set_trace()  # fmt: skip
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
