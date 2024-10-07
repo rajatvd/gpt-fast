@@ -3,11 +3,13 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+from contextlib import redirect_stdout
 import itertools
 import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Union
+from model import Attention
 
 import torch
 import torch._dynamo.config
@@ -296,6 +298,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
+
     return model.eval()
 
 
@@ -364,6 +367,27 @@ def main(
     print("Loading model ...")
     t0 = time.time()
     model = _load_model(checkpoint_path, device, precision, use_tp)
+
+    for m in model.modules():
+        if isinstance(m, Attention):
+            m.fuse_qk()
+
+    # with open("out.txt", "w") as f:
+    #     with redirect_stdout(f):
+    #         # print params in all wqkv weights, and also add up the total number of values in these weights
+    #         total = sum(
+    #             [
+    #                 v.numel() * v.dtype.itemsize
+    #                 for k, v in model.state_dict().items()
+    #                 if "wqkv" or "wo" in k and not isinstance(v, torch.nn.Embedding):
+    #             ]
+    #         )
+
+    #         print("Total number of values in wqkv weights:", total)
+    #         print(f"Size in GB: {total / 1024 / 1024 / 1024}")
+
+    #         size, params = _get_model_size(model)
+    #         print(f"Model size: {size / 1024 / 1024 / 1024} GB")
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -546,6 +570,7 @@ if __name__ == "__main__":
         type=Path,
         # default=Path("checkpoints/meta-llama/Meta-Llama-3.1-8B/model.pth"),
         default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"),
+        # default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model_int8.pth"),
         # default=Path("checkpoints/meta-llama/Meta-Llama-3.1-8B/model_int8.pth"),
         help="Model checkpoint path.",
     )

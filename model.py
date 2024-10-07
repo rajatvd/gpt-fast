@@ -185,6 +185,33 @@ class KVCache(nn.Module):
         return k_out, v_out
 
 
+class XVCache(nn.Module):
+    def __init__(
+        self,
+        max_batch_size,
+        max_seq_length,
+        n_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+    ):
+        super().__init__()
+        x_cache_shape = (max_batch_size, 1, max_seq_length, head_dim * n_heads)
+        v_cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        self.register_buffer("x_cache", torch.zeros(x_cache_shape, dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros(v_cache_shape, dtype=dtype))
+
+    def update(self, input_pos, x_val, v_val):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == x_val.shape[2]
+
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = x_val
+        v_out[:, :, input_pos] = v_val
+
+        return k_out, v_out
+
+
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -280,6 +307,7 @@ class Attention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        self.wa = nn.Linear(config.dim, config.dim, bias=False)
         self.kv_cache = None
 
         self.n_head = config.n_head
@@ -294,6 +322,26 @@ class Attention(nn.Module):
             wk = state_dict.pop(prefix + "wk.weight")
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
+        if prefix + "wqkv.weight" in state_dict:
+            state_dict[prefix + "wa.weight"] = torch.zeros(
+                self.dim,
+                self.dim,
+                dtype=self.wa.weight.dtype,
+            )
+        return state_dict
+
+    def fuse_qk(self):
+        print("post_load_hook")
+        kv_size = self.n_local_heads * self.head_dim
+        wq = self.wqkv.weight[: self.dim, :]
+        wk = self.wqkv.weight[self.dim : self.dim + kv_size, :]
+
+        print("start")
+        print(wq.device, self.wa.weight.device)
+        # self.wa.weight.data = wq.t() @ wk
+        with torch.no_grad():
+            self.wa.weight.copy_(wk.t() @ wq)
+        print("end")
 
     def forward(
         self,
@@ -305,36 +353,49 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        # q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        wv = self.wqkv.weight[self.dim + kv_size :, :]
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+        z = self.wa(x)
+        v_ = x @ wv.t()
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        x_ = x.view(bsz, seqlen, self.n_head, self.head_dim)
+        z = z.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        v_ = v_.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+
+        z = apply_rotary_emb(z, freqs_cis)
+        x_ = apply_rotary_emb(x_, freqs_cis)
+
+        x_, z, v_ = map(lambda x: x.transpose(1, 2), (x_, z, v_))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            z, v_ = self.kv_cache.update(input_pos, z, v_)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        z = z.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        v_ = v_.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        attn_bias = torch.zeros_like(mask, dtype=q.dtype)
+        # print(k.shape)
+        if seqlen > 6:
+            import ipdb; ipdb.set_trace()  # fmt: skip
+
+        affinities = x_ @ z.transpose(-2, -1)
+
+        attn_bias = torch.zeros_like(mask, dtype=x_.dtype)
         attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
-        attn_weights = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) + attn_bias
+        attn_weights = affinities / math.sqrt(self.head_dim) + attn_bias
         attn_weights = F.softmax(attn_weights, dim=-1)
-        y = attn_weights @ v
+        y = attn_weights @ v_
 
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         # print((y1 - y).abs().max() / y.abs().max())
         # import ipdb; ipdb.set_trace()  # fmt: skip
 
+        # import ipdb; ipdb.set_trace()  # fmt: skip
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
         y = self.wo(y)
+        # import ipdb; ipdb.set_trace()  # fmt: skip
         return y
 
 
